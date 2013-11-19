@@ -79,6 +79,7 @@ my $processed = 0;
 my $notifyEvery = $numberOfKeys * $informEveryPercent/100;
 my $notifyCounter = -1;
 while ( my $key = <$keys> ) {
+    next if $key =~ m/^admin./;
     $notifyCounter++;
     $processed++;
     if ( $notifyCounter >= $notifyEvery ) {
