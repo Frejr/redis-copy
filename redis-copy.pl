@@ -7,13 +7,16 @@ use Redis;
 use Getopt::Long;
 use Try::Tiny;
 use Data::Dumper;
+use Time::HiRes qw/ gettimeofday tv_interval /;
 
 my $from;
 my $to;
 my $keyfile;
 my $numberOfKeys;
-my $maxHashKeysMove = 1000; # too many keys from hash at once killing nutcracker
-my $informEveryPercent = 5; # How often print information about progress. Integer value <0,100> (not validated)
+my $maxHashKeysMove = 10_000; # too many keys from hash at once killing nutcracker
+my $informEveryPercent = 2; # How often print information about progress. Integer value <0,100> (not validated)
+my $t;                      # Microtime
+my $stats;
 
 # Parameters from, to, and file with list of keys to copy
 # are required. nok is optional. It's used to estimate
@@ -23,14 +26,16 @@ GetOptions (
     "to=s" => \$to, 
     "keyfile=s" => \$keyfile,
     "nok=i" => \$numberOfKeys,
+    "stats" => \$stats,
     );
 
+my %benchmark;
 
 sub CheckRequiredParameters {
     foreach  my $argument ( @_ ) {
         if ( ! defined( $argument ) ) {
             print<<END
-Usage:  --from [ip:port|/path/to/socket] --to [ip:port|/path/to/socket] --keyfile /path/to/file/with/keys [--nok numberOfKeys]
+Usage:  --from [ip:port|/path/to/socket] --to [ip:port|/path/to/socket] --keyfile /path/to/file/with/keys [--nok numberOfKeys] [--stats]
 END
 ;
             exit 1;
@@ -84,14 +89,18 @@ while ( my $key = <$keys> ) {
     my $ktype = $sredis->type( "$key" ); # differents type - different treatment.
 # STRING
     if ( $ktype eq "string" ) {
+        $t = [gettimeofday] if ( $stats );
         $dredis->set( $key => $sredis->get( $key ) );
+        $benchmark{'string'}{'count'}++ if ( $stats );
+        $benchmark{'string'}{'time'}+= tv_interval($t) if ( $stats );
     }
 # HASH
     elsif ( $ktype eq "hash" ) {
+        $t = [gettimeofday] if ( $stats );
         if ( $sredis->hlen( $key ) <= $maxHashKeysMove ) {
             $dredis->hmset( $key => $sredis->hgetall( $key ) );
         } else {
-            print "Hash \"$key\" has ".$sredis->hlen( "$key" )." elements. It's more than treshold: $maxHashKeysMove. Moving partially... ";
+            print "Hash \"$key\" has ".$sredis->hlen( "$key" )." elements. It's more than treshold: $maxHashKeysMove. Moving partially";
             my @hkeys = $sredis -> hkeys( $key );
             while ( my @hpart = splice @hkeys, 0, $maxHashKeysMove ) {
                 my %hash;
@@ -100,30 +109,41 @@ while ( my $key = <$keys> ) {
                 @hash{@hpart} = $sredis->hmget( $key, @hpart );
                 $dredis->hmset( $key,  %hash );
             }
-            print "Done\n";
+            print " Done\n";
             print STDERR "[CRITICAL] Length of hash \"$key\" on source and destination not the same\n" if ( $dredis->hlen( "$key" ) != $sredis->hlen( "$key" ) );
         }
+        $benchmark{'hash'}{'count'}++ if ( $stats );
+        $benchmark{'hash'}{'time'}+= tv_interval($t) if ( $stats );
     }
 # LIST
     elsif ( $ktype eq "list" ) {
+        $t = [gettimeofday] if ( $stats );
         $dredis->del( $key ) if $dredis->exists( $key );
         $dredis->rpush( $key, $sredis->lrange( $key, 0, -1 ) );
         print STDERR "[CRITICAL] Length of list \"$key\" on source and destination not the same\n" if ( $dredis->llen( "$key" ) != $sredis->llen( "$key" ) );
+        $benchmark{'list'}{'count'}++ if ( $stats );
+        $benchmark{'list'}{'time'}+= tv_interval($t) if ( $stats );
     }
 # SET
     elsif ( $ktype eq "set" ) {
+        $t = [gettimeofday] if ( $stats );
         my @members = $sredis->smembers( $key );
         while ( my $member = shift @members ) {
             $dredis->sadd( $key, $member );
         }
         print "[CRITICAL] Length of set \"$key\" on source and destination not the same\n" if ( $dredis->scard( "$key" ) != $sredis->scard( "$key" ) );
+        $benchmark{'set'}{'count'}++ if ( $stats );
+        $benchmark{'set'}{'time'}+= tv_interval($t) if ( $stats );
     }
 # ZSET
     elsif ( $ktype eq "zset" ) {
+        $t = [gettimeofday] if ( $stats );
         my @zrangelist = $sredis->zrange( $key, 0, -1, "WITHSCORES" );
         while ( my ( $k, $v ) = splice @zrangelist, 0, 2 ) {
            $dredis->zadd( $key, $v, $k );
         }
+        $benchmark{'zset'}{'count'}++ if ( $stats );
+        $benchmark{'zset'}{'time'}+= tv_interval($t) if ( $stats );
     }
 ##### not processed :(
     else {
@@ -134,8 +154,20 @@ while ( my $key = <$keys> ) {
         }
     }
 # TTL
+    $t = [gettimeofday] if ( $stats );
     my $kttl = $sredis->ttl( $key );
     $dredis->expire( $key, $kttl ) if ( $kttl != -1 );
+    $benchmark{'ttl'}{'count'}++ if ( $stats );
+    $benchmark{'ttl'}{'time'}+= tv_interval($t) if ( $stats );
+}
+
+if ( $stats ) {
+    for my $key ( keys %benchmark ) {
+        print "$key\n";
+        printf "  %14s: %d\n", "count", $benchmark{$key}{'count'};
+        printf "  %14s: %.5fs\n", "time", $benchmark{$key}{'time'};
+        printf "  %14s: %.5fs\n", "time per key", $benchmark{$key}{'time'}/$benchmark{$key}{'count'};
+    }
 }
 
 # vim:ts=4 et softtabstop=4 sw=4 hlsearch nu
