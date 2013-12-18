@@ -8,6 +8,7 @@ use Getopt::Long;
 use Try::Tiny;
 use Data::Dumper;
 use Time::HiRes qw/ gettimeofday tv_interval /;
+use Sys::Syslog;
 
 my $from;
 my $to;
@@ -30,6 +31,8 @@ GetOptions (
     );
 
 my %benchmark;
+openlog("redis-copy", "ndelay", "local0");
+open LOGFILE, ">>", "redis-copy.log";
 
 sub CheckRequiredParameters {
     foreach  my $argument ( @_ ) {
@@ -43,6 +46,10 @@ END
     }
 }
 
+sub LOG {
+    syslog( 'info', @_ );
+    print LOGFILE "@_", "\n";
+}
 
 sub ConnectRedis {
 # addres of redis as argument neded (ip:port or socket)
@@ -58,7 +65,7 @@ sub ConnectRedis {
         try {
             $redis = Redis->new( sock => "$socket" );
         } catch {
-            die "Can't connect to $socket\n";
+            LOG "Can't connect to $socket\n";
         }
     }
     return $redis;
@@ -91,7 +98,7 @@ while ( my $key = <$keys> ) {
 # STRING
     if ( $ktype eq "string" ) {
         $t = [gettimeofday] if ( $stats );
-        $dredis->set( $key => $sredis->get( $key ) );
+        try{ $dredis->set( $key => $sredis->get( $key ) ); } catch { LOG("[CRITICAL] key: \"$key\" not moved"); };
         $benchmark{'string'}{'count'}++ if ( $stats );
         $benchmark{'string'}{'time'}+= tv_interval($t) if ( $stats );
     }
@@ -99,7 +106,7 @@ while ( my $key = <$keys> ) {
     elsif ( $ktype eq "hash" ) {
         $t = [gettimeofday] if ( $stats );
         if ( $sredis->hlen( $key ) <= $maxHashKeysMove ) {
-            $dredis->hmset( $key => $sredis->hgetall( $key ) );
+            try { $dredis->hmset( $key => $sredis->hgetall( $key ) ); } catch { LOG("[CRITICAL] key: \"$key\" not moved"); };
         } else {
             print "Hash \"$key\" has ".$sredis->hlen( "$key" )." elements. It's more than treshold: $maxHashKeysMove. Moving partially";
             my @hkeys = $sredis -> hkeys( $key );
@@ -108,10 +115,10 @@ while ( my $key = <$keys> ) {
                 print ".";
                 # concantenating two arrays into one hash with key from the first one
                 @hash{@hpart} = $sredis->hmget( $key, @hpart );
-                $dredis->hmset( $key,  %hash );
+                try { $dredis->hmset( $key,  %hash ); } catch { LOG("[CRITICAL] key: \"$key\" not moved"); };
             }
             print " Done\n";
-            print STDERR "[CRITICAL] Length of hash \"$key\" on source and destination not the same\n" if ( $dredis->hlen( "$key" ) != $sredis->hlen( "$key" ) );
+            LOG ("[CRITICAL] Length of hash \"$key\" on source and destination not the same\n" ) if ( $dredis->hlen( "$key" ) != $sredis->hlen( "$key" ) );
         }
         $benchmark{'hash'}{'count'}++ if ( $stats );
         $benchmark{'hash'}{'time'}+= tv_interval($t) if ( $stats );
@@ -120,7 +127,7 @@ while ( my $key = <$keys> ) {
     elsif ( $ktype eq "list" ) {
         $t = [gettimeofday] if ( $stats );
         $dredis->del( $key ) if $dredis->exists( $key );
-        $dredis->rpush( $key, $sredis->lrange( $key, 0, -1 ) );
+        try { $dredis->rpush( $key, $sredis->lrange( $key, 0, -1 ) ); } catch { LOG("[CRITICAL] key: \"$key\" not moved"); };
         print STDERR "[CRITICAL] Length of list \"$key\" on source and destination not the same\n" if ( $dredis->llen( "$key" ) != $sredis->llen( "$key" ) );
         $benchmark{'list'}{'count'}++ if ( $stats );
         $benchmark{'list'}{'time'}+= tv_interval($t) if ( $stats );
@@ -130,9 +137,9 @@ while ( my $key = <$keys> ) {
         $t = [gettimeofday] if ( $stats );
         my @members = $sredis->smembers( $key );
         while ( my $member = shift @members ) {
-            $dredis->sadd( $key, $member );
+            try { $dredis->sadd( $key, $member ); } catch { LOG("[CRITICAL] key: \"$key\" not moved"); };
         }
-        print "[CRITICAL] Length of set \"$key\" on source and destination not the same\n" if ( $dredis->scard( "$key" ) != $sredis->scard( "$key" ) );
+        LOG ( "[CRITICAL] Length of set \"$key\" on source and destination not the same\n" ) if ( $dredis->scard( "$key" ) != $sredis->scard( "$key" ) );
         $benchmark{'set'}{'count'}++ if ( $stats );
         $benchmark{'set'}{'time'}+= tv_interval($t) if ( $stats );
     }
@@ -141,7 +148,7 @@ while ( my $key = <$keys> ) {
         $t = [gettimeofday] if ( $stats );
         my @zrangelist = $sredis->zrange( $key, 0, -1, "WITHSCORES" );
         while ( my ( $k, $v ) = splice @zrangelist, 0, 2 ) {
-           $dredis->zadd( $key, $v, $k );
+           try { $dredis->zadd( $key, $v, $k ); } catch { LOG("[CRITICAL] key: \"$key\" not moved"); };
         }
         $benchmark{'zset'}{'count'}++ if ( $stats );
         $benchmark{'zset'}{'time'}+= tv_interval($t) if ( $stats );
@@ -149,15 +156,15 @@ while ( my $key = <$keys> ) {
 ##### not processed :(
     else {
         if ( ! $sredis->exists( $key ) ) {
-            print STDERR "[CRITICAL] Key \"$key\" was not copied because were not found on source redis.\n";
+           LOG ( "[CRITICAL] Key \"$key\" was not copied because were not found on source redis." );
         } else {
-            print STDERR "[CRITICAL] Key \"$key\" with type \"$ktype\" was not copied because is not supported yet.\n";
+           LOG ( "[CRITICAL] Key \"$key\" with type \"$ktype\" was not copied because is not supported yet." );
         }
     }
 # TTL
     $t = [gettimeofday] if ( $stats );
     my $kttl = $sredis->ttl( $key );
-    $dredis->expire( $key, $kttl ) if ( $kttl != -1 );
+    if ( $kttl != -1 ) { try {$dredis->expire( $key, $kttl ) } catch { LOG("[CRITICAL] key: \"$key\" not moved"); }; };
     $benchmark{'ttl'}{'count'}++ if ( $stats );
     $benchmark{'ttl'}{'time'}+= tv_interval($t) if ( $stats );
 }
